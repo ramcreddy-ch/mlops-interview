@@ -11,22 +11,13 @@ Optimizing ML workloads on K8s requires understanding the difference between com
 
 **1. Resource Requests and Limits:**
 *   **The Problem:** Setting `requests` == `limits` (Guaranteed QoS) is standard best practice for web apps. But ML workloads are bursty. An inference request might spike CPU to 400% for 50ms, then drop to 5%. If you set limits too tight, K8s CPU throttling (`CPU CFS quota`) will artificially slow down inference latency.
-*   **The Fix:** For CPU inference, I set a moderate `request` (e.g., 2 vCPU) for scheduling, but remove the CPU `limit` entirely (or set it very high). This allows the pod to burst and use available node CPU to process the request faster, decreasing latency. Memory limits, however, *must* be strictly set to prevent node-level OOMs.
+*   **The Fix:** For CPU inference, I set a moderate `request` (e.g., 2 vCPU) for scheduling, but remove the CPU `limit` entirely (or set it very high). This allows the pod to burst. Memory limits, however, *must* be strictly set to prevent node-level OOMs.
 
 **2. Node Affinity and Taints/Tolerations:**
 *   **The Problem:** A random backend microservice scheduling onto a $30/hour GPU node.
 *   **The Fix:** We use separate node pools.
     *   **GPU Node Pool:** Tainted with `nvidia.com/gpu=true:NoSchedule`. Only ML pods with the corresponding toleration can land here.
     *   **CPU Node Pool:** Labelled `workload-type=ml-inference`.
-    *   ML deployments use `nodeSelector` or `nodeAffinity` to ensure they land on the right hardware.
-
-**3. GPU Optimization (The tricky part):**
-*   Unlike CPUs, GPUs cannot natively be shared fractionally across pods in raw Kubernetes. If a pod requests `nvidia.com/gpu: 1`, it owns the entire GPU, even if it only uses 10% of the compute.
-*   **The Fix (Time-slicing):** For development environments (JupyterHub), we configured the NVIDIA GPU operator to enable time-slicing, allowing one physical GPU to appear as 4 or 8 virtual GPUs, sharing the compute and memory (though without hard isolation).
-*   **The Fix (MIG):** For production A100s, we use Multi-Instance GPU (MIG) to carve the GPU into distinct hardware-isolated slices (e.g., `1g.5gb`), allowing multiple inference pods to share a node securely.
-
-**Trade-offs:**
-Removing CPU limits can lead to noisy neighbor problems if nodes are over-provisioned. You have to monitor node CPU utilization closely. Time-slicing GPUs saves money but can cause OOM errors if one user's notebook consumes all the VRAM.
 
 ---
 
@@ -38,36 +29,20 @@ Standard Horizontal Pod Autoscaler (HPA) based on CPU utilization was failing us
 **Answer:**
 
 **Why CPU-based HPA fails for ML:**
-ML models (especially using frameworks like PyTorch or TensorFlow) are designed to consume all available resources to compute matrix multiplications as fast as possible. High CPU/GPU utilization is expected, not necessarily an indicator that the pod is overwhelmed.
+ML models consume all available resources to compute matrix multiplications as fast as possible. High CPU/GPU utilization is expected, not necessarily an indicator that the pod is overwhelmed.
 
 **My Autoscaling Strategy (Custom Metrics):**
-
 We abandoned CPU HPA and moved to **Requests Per Second (RPS)** or **Concurrency-based scaling**.
 
-1.  **Metrics Server:** We use Datadog (or Prometheus Adapter) to expose custom metrics to the Kubernetes API.
-2.  **The Metric:** We track `nginx.ingress.requests.rate` or custom application metrics exposing the queue depth.
-3.  **HPA Configuration:**
-    ```yaml
-    apiVersion: autoscaling/v2
-    kind: HorizontalPodAutoscaler
-    spec:
-      metrics:
-      - type: Pods
-        pods:
-          metric:
-            name: requests_per_second
-          target:
-            type: AverageValue
-            averageValue: 20  # Scale up when average RPS per pod exceeds 20
-    ```
+1.  **Metrics Server:** We use Datadog to expose custom metrics to the Kubernetes API.
+2.  **HPA Configuration:** Scale based on `requests_per_second`.
 
 **Handling Cold Starts (The ML Challenge):**
-Scaling up a web app takes 2 seconds. Scaling up a 5GB ML model takes 1-2 minutes. If a traffic spike hits, RPS-based HPA will request new pods, but the existing pods will be crushed before the new ones are ready.
+Scaling up a 5GB ML model takes 1-2 minutes. If a traffic spike hits, RPS-based HPA will request new pods, but the existing pods will be crushed before the new ones are ready.
 
 **The Fix:**
 1.  **Over-provisioning slightly:** We set `targetAverageValue` lower than the pod's actual capacity to create a buffer.
-2.  **KEDA (Kubernetes Event-driven Autoscaling):** We use KEDA to scale based on Kafka lag or SQS queue length for asynchronous ML workloads. KEDA can also scale deployments to zero when there's no traffic, saving massive costs on GPU nodes.
-3.  **VPA (Vertical Pod Autoscaler):** We use VPA strictly in "Off" or "Recommend" mode to profile memory usage over time and right-size our resource requests. We never use auto-update VPA for ML pods, as restarting a heavy ML pod causes unacceptable latency spikes.
+2.  **KEDA:** We use KEDA to scale based on Kafka lag. KEDA can also scale deployments to zero when there's no traffic.
 
 ---
 
@@ -78,30 +53,10 @@ A data scientist wanted to test a new XGBoost model against the production versi
 
 **Answer:**
 
-Deploying ML models is risky because they degrade silently. You must test with real production traffic.
-
 **Architecture (using Istio or KServe):**
 
 1.  We have two K8s Deployments: `model-v1` (Production) and `model-v2` (Canary).
 2.  We use an Istio `VirtualService` to split traffic routing at the network edge.
-
-```yaml
-apiVersion: networking.istio.io/v1alpha3
-kind: VirtualService
-metadata:
-  name: fraud-routing
-spec:
-  hosts:
-  - fraud-service.default.svc.cluster.local
-  http:
-  - route:
-    - destination:
-        host: model-v1
-      weight: 95
-    - destination:
-        host: model-v2
-      weight: 5
-```
 
 **The Rollout Process:**
 1.  CD pipeline deploys `model-v2` and updates Istio to 5% traffic.
@@ -110,11 +65,68 @@ spec:
 4.  We wait 24 hours. Data science team reviews the prediction distribution (are the scores similar to v1?) and business metrics.
 5.  If approved, CD updates to 100%. `model-v1` is scaled down.
 
-**Alternative: Shadow Deployments**
-For high-risk models (e.g., loan approval), even 5% canary is too risky. We use Istio's mirroring feature to send a copy of 100% of the traffic to `model-v2`. The responses from v2 are logged to Kafka but *dropped* (not returned to the user). This allows us to compare v1 vs v2 predictions on identical production traffic with zero user impact.
+---
 
-**Common Mistakes:**
-- Doing canary rollouts based on K8s native rolling updates (modifying a single Deployment). Native K8s doesn't give you fine-grained traffic percentage control; it just replaces pods one by one. You need a service mesh (Istio/Linkerd) or an ingress controller (NGINX/Contour) that supports traffic splitting.
+## Q4: How do you manage massive datasets (TBs of images/text) for training jobs in Kubernetes?
+
+**Real-world context:**
+Data scientists were baking 50GB datasets directly into their Docker images. Docker pulls were taking 20 minutes, node disks were filling up instantly, and Kubernetes was crashing. 
+
+**Answer:**
+
+You absolutely cannot put datasets in Docker images or Git repositories.
+
+**Strategy 1: Network Attached Storage (NFS/EFS) via PVCs**
+*   **How:** We create a Kubernetes Persistent Volume Claim (PVC) backed by Amazon EFS or GCP Filestore. 
+*   **Pros:** The data scientist mounts the PVC to their training pod at `/data`. They can read files using standard Python `open()`. Multiple pods can read the exact same data simultaneously (ReadWriteMany).
+*   **Cons:** NFS is notoriously slow for Deep Learning. If your GPU can process 10,000 images a second, but NFS can only serve 500 images a second, your GPU utilization drops to 5%.
+
+**Strategy 2: Streaming from Object Storage (S3/GCS)**
+*   **How:** We use libraries like `webdataset` (for PyTorch) or TensorFlow Datasets. The training script streams the dataset as a tar archive directly from S3 into memory, completely bypassing the local Kubernetes node disk.
+*   **Pros:** Infinite scale, extremely high throughput (S3 can saturate a 100Gbps network link), and zero local disk required on the K8s nodes.
+*   **The Winner:** For anything over 100GB, streaming from S3 is mandatory.
+
+---
+
+## Q5: Standard Kubernetes scheduling is terrible for distributed ML training. Why, and what do you use instead?
+
+**Real-world context:**
+A data scientist launched a PyTorch distributed training job requiring 8 pods (each requesting 1 GPU). The K8s cluster only had 4 GPUs available. K8s scheduled 4 pods, and the other 4 sat in "Pending". The 4 running pods just sat there infinitely waiting for the others to join the NCCL communication ring, wasting thousands of dollars.
+
+**Answer:**
+
+**The Root Cause:**
+Default Kubernetes uses a "Pod-by-Pod" scheduler. It tries to place one pod at a time. This is perfect for web servers. 
+Distributed ML training (MPI, PyTorch DDP) requires "All-or-Nothing" scheduling. The job cannot start unless *all* workers are running. If you get 7 out of 8 pods, the job hangs.
+
+**The Fix: Gang Scheduling**
+We replaced standard Deployments with **Kubeflow Training Operator** (which uses Volcano or Kueue under the hood for scheduling).
+
+*   **How it works:** When a `PyTorchJob` requests 8 GPUs, the gang scheduler checks the cluster state. If only 4 GPUs are available, it leaves *all 8 pods* in a pending state (or an internal queue) until enough resources free up. Once 8 GPUs are available, it schedules all 8 pods simultaneously.
+*   This prevents deadlocks, prevents wasting expensive GPU hours on partially-scheduled jobs, and allows for fair-share queuing between different data science teams.
+
+---
+
+## Q6: How do you secure ML pods running on Kubernetes?
+
+**Real-world context:**
+We found a data scientist running a Jupyter notebook pod as `root`, mounting the host node's Docker socket, which effectively gave them root access to the entire underlying EC2 instance.
+
+**Answer:**
+
+**1. Pod Security Admission (PSA):**
+We enforce the `Restricted` profile across all ML namespaces. 
+*   Pods cannot run as root (`runAsNonRoot: true`).
+*   Containers cannot mount host paths (prevents escaping the container).
+*   Privilege escalation is explicitly denied.
+
+**2. Network Policies:**
+By default, any pod in K8s can talk to any other pod. A compromised Jupyter notebook could scan the internal network and query the production PostgreSQL database.
+*   We implement default-deny network policies. 
+*   The `jupyter-notebook` pods are explicitly only allowed to talk to the Internet (for downloading packages) and the specific internal S3 endpoint for data.
+
+**3. IAM Roles for Service Accounts (IRSA/Workload Identity):**
+We never inject AWS/GCP credentials as environment variables. We map a K8s ServiceAccount to an AWS IAM Role. The ML pod assumes that role via OIDC, getting temporary, short-lived tokens that only allow access to a specific S3 bucket path (e.g., `s3://ml-data/team-a/*`).
 
 ---
 *[Back to README](../README.md)*

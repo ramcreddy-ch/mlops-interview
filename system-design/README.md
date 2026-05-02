@@ -81,4 +81,54 @@ Cost: Kubecost labels by namespace for chargeback
 
 ---
 
+## Q5: Design a multi-region, high-availability ML inference architecture for a global application.
+
+**Context:** Our image classification API needed to serve users in the US, Europe, and Asia with < 200ms latency, surviving a complete AWS region failure.
+
+**Architecture:**
+```
+Global Traffic Manager (Route 53 Latency-Based Routing)
+  |--> US-East-1 Region
+  |      |--> ALB --> EKS Cluster --> KServe Pods
+  |      |--> Local ElastiCache (Redis) for features
+  |--> EU-West-1 Region
+  |      |--> ALB --> EKS Cluster --> KServe Pods
+  |      |--> Local ElastiCache (Redis) for features
+```
+
+**The Challenge: Model and Data Synchronization**
+You cannot copy a 5GB model to 3 regions over the internet every time a pod scales up.
+1. **Model Distribution:** CI/CD pipeline pushes the Docker image to a global ECR registry (which replicates to all regions automatically). 
+2. **Feature Synchronization:** We use DynamoDB Global Tables or Redis Enterprise Active-Active. If a user updates their profile in Europe, the feature store replicates that change to the US in <1 second so the model has the freshest data regardless of where the traffic routes.
+
+**Failover Testing:**
+We run chaos engineering tests ("Chaos Gorilla") monthly where we sever the network connection to `us-east-1`. Route 53 detects the health check failure and shifts traffic to `eu-west-1` within 60 seconds. The European EKS cluster HPA scales up the pods automatically to handle the 2x traffic load.
+
+---
+
+## Q6: Design an automated A/B testing pipeline for ML models.
+
+**Context:** The marketing team wanted to test 5 different recommendation models concurrently, measuring actual CTR (Click-Through Rate) before declaring a winner.
+
+**Architecture:**
+```
+Client Request --> API Gateway
+  |--> A/B Routing Service (Redis backed)
+        - Looks up user_id
+        - Deterministically hashes user_id to select a model variant (A, B, C, D, E)
+        - E.g., user_123 -> Model C
+  |--> K8s Inference Cluster
+        - Deployment A (Control)
+        - Deployment B, C, D, E (Challengers)
+```
+
+**Tracking the winner:**
+1. The Inference Service logs the prediction to Kafka, tagged with `variant: C`.
+2. When the user eventually clicks a recommended item (or doesn't), the client app fires an event to Kafka.
+3. A Spark Streaming job joins the "Prediction" stream with the "Click" stream on `request_id`.
+4. It calculates the CTR for each variant and pushes it to a Grafana dashboard.
+
+**Crucial detail:** The assignment of users to models MUST be deterministic. If a user gets Model A at 9:00 AM, they must get Model A at 9:05 AM. If you use round-robin load balancing, the user experience will be chaotic and the A/B test data will be statistically invalid. We use a hashing function: `hash(user_id + experiment_id) % 100`.
+
+---
 *[Back to README](../README.md)*

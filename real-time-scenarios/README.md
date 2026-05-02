@@ -23,9 +23,8 @@ Lag means `production rate > consumption rate`. I immediately checked Datadog to
 2. Scaled the K8s inference deployment from 32 to 64 pods to increase concurrent consumption (since we had 64 Kafka partitions, we could have up to 64 active consumers in the group).
 
 **Prevention strategy:**
-1. **Timeouts & Circuit Breakers:** The Redis client had a default timeout of 2 seconds. I reduced it to 50ms. If feature retrieval fails within 50ms, a circuit breaker trips, returning a "safe default" feature vector so the transaction can be scored (perhaps less accurately, but meeting the SLA).
+1. **Timeouts & Circuit Breakers:** The Redis client had a default timeout of 2 seconds. I reduced it to 50ms. If feature retrieval fails within 50ms, a circuit breaker trips, returning a "safe default" feature vector.
 2. **Asynchronous I/O:** Switched the Python Kafka consumer to use `asyncio` for feature fetching and inference, preventing blocking on network I/O.
-3. **Alerting:** Set a Datadog monitor on Kafka lag > 5,000 messages for 1 minute, paging the on-call engineer before it hits the 5-minute SLA limit.
 
 ---
 
@@ -48,11 +47,11 @@ Latency in ML comes from three places: data loading, computation, or network.
 3. Why? A data engineer had accidentally dropped an index on the `user_history` table during a midnight migration.
 
 **Another scenario (Model issue):**
-I've also seen this happen due to the model inputs themselves. If an NLP model uses dynamic padding (padding the batch to the longest sequence in the batch), and a user suddenly sends a 10,000-word essay to an endpoint that usually sees 10-word queries, the batch size expands, memory spikes, and computation takes 100x longer.
+If an NLP model uses dynamic padding (padding the batch to the longest sequence in the batch), and a user suddenly sends a 10,000-word essay to an endpoint that usually sees 10-word queries, the batch size expands, memory spikes, and computation takes 100x longer.
 
 **Fix & Prevention:**
 - **For the DB issue:** Restored the index. Added Datadog alerts on slow queries > 100ms.
-- **For the dynamic padding issue:** Implemented strict input validation. Truncate inputs to a maximum sequence length (e.g., 512 tokens) at the API gateway level before it ever hits the model.
+- **For the dynamic padding issue:** Implemented strict input validation. Truncate inputs to a maximum sequence length at the API gateway level.
 
 ---
 
@@ -63,12 +62,6 @@ During a marketing campaign, our model serving pods started continuously restart
 
 **Answer:**
 
-**Root cause analysis:**
-`OOMKilled` means the pod exceeded its `resources.limits.memory`.
-In ML, memory spikes usually happen for two reasons:
-1. Loading the model into RAM (if it's a large model and multiple worker processes load separate copies).
-2. Processing large batches or large payload sizes.
-
 **Debugging steps:**
 1. `kubectl describe pod <pod-name>` confirmed the `OOMKilled` exit code 137.
 2. Checked Datadog memory profiles. The memory grew linearly with the number of concurrent requests.
@@ -76,19 +69,17 @@ In ML, memory spikes usually happen for two reasons:
 
 **The Fix (Immediate):**
 1. Hot-patched the K8s deployment to increase the memory limit to 10GB to stabilize the system.
-2. Alternatively, if nodes are full, reduce the Gunicorn worker count from 8 to 2 so memory stays under 4GB, but throughput will drop.
+2. Alternatively, reduce the Gunicorn worker count from 8 to 2 so memory stays under 4GB (throughput will drop, but the system stays up).
 
 **The Fix (Long-term):**
-1. **Shared Memory:** Switched from Flask to KServe (or Triton/FastAPI). These frameworks load the model into memory once, and multiple threads/coroutines share the model for inference, drastically reducing memory overhead.
-2. **Batch Size Limits:** Configured maximum payload sizes at the ingress layer. A user shouldn't be able to send a 50MB JSON array for inference in a single request.
-3. **Right-sizing:** Ran load tests using Locust to profile actual memory usage under stress, and set K8s `requests` and `limits` appropriately (e.g., Request: 3GB, Limit: 4GB).
+1. **Shared Memory:** Switched from Flask to KServe/Triton. These frameworks load the model into memory once, and multiple threads/coroutines share the model for inference, drastically reducing memory overhead.
 
 ---
 
 ## Q4: Datadog alerts are noisy, and your team is experiencing alert fatigue. How do you fix your monitoring strategy?
 
 **Real-world context:**
-Our Slack channel had 500+ alerts a day. "Pod restarted", "CPU > 80%", "Kafka lag > 100". Engineers started ignoring the channel. Then a silent failure happened where predictions were all zeros for 4 hours, and nobody noticed because it was buried in noise.
+Our Slack channel had 500+ alerts a day. "Pod restarted", "CPU > 80%", "Kafka lag > 100". Engineers started ignoring the channel. Then a silent failure happened where predictions were all zeros for 4 hours, and nobody noticed.
 
 **Answer:**
 
@@ -96,24 +87,53 @@ Our Slack channel had 500+ alerts a day. "Pod restarted", "CPU > 80%", "Kafka la
 We were alerting on *causes* (CPU high) rather than *symptoms* (users are affected). This is an anti-pattern. High CPU is only a problem if latency goes up or requests fail.
 
 **Debugging steps & Strategy shift:**
-I completely overhauled the Datadog monitors based on Google's SRE principles (SLIs/SLOs).
-
 1.  **Deleted all static threshold alerts** on CPU, Memory, and Network. High CPU is the HPA's job to fix, not a human's.
 2.  **Created Symptom-Based Alerts (P1 - PagerDuty):**
     *   **Latency:** P99 inference latency > 100ms for 5 minutes.
     *   **Error Rate:** 5xx HTTP errors > 1% for 5 minutes.
-    *   **Traffic Drop:** Incoming requests drop by > 50% compared to the same time last week (anomaly detection).
 3.  **Created ML-Specific Alerts (P2 - Slack/Jira):**
     *   **Data Drift:** Feature PSI > 0.2 (checked daily).
     *   **Prediction Skew:** Ratio of "approved" vs "denied" shifts by > 10%.
     *   **Feature Missing Rate:** Null values in input features > 5%.
-4.  **Used Composite Monitors:** Only alert if Kafka lag is high AND inference throughput has dropped.
 
-**Trade-offs:**
-- Anomaly detection monitors in Datadog can be tricky to tune for seasonal data. You have to ensure the baseline is accurate, otherwise, they become noisy too.
+---
 
-**Common mistakes:**
-- Alerting when a single pod restarts. In K8s, pods are ephemeral. Restarts are expected. Only alert if the Deployment's availability drops below the target replica count.
+## Q5: A new model version is deployed, and suddenly the Feature Store (Redis) crashes due to a "Cache Stampede". What happened?
+
+**Real-world context:**
+We did a blue/green deployment of a new recommendation model at 9:00 AM. At 9:01 AM, our 6-node Redis cluster hit 100% CPU and stopped responding to all requests, taking down 4 other microservices.
+
+**Answer:**
+
+**Root Cause Analysis:**
+A "Cache Stampede" (or Thundering Herd) happens when a highly requested cache key expires, and thousands of concurrent requests all miss the cache simultaneously. They all hit the underlying database to compute the feature, and then they all try to write the result back to Redis at the exact same millisecond.
+
+In our ML context, the new model `v2` required a brand new feature `user_engagement_score_v2` that didn't exist in Redis yet.
+When we flipped 100% of traffic to the `v2` model, suddenly 10,000 inference pods per second queried Redis for this feature, got a cache miss, and simultaneously fired off complex SQL queries to PostgreSQL to compute it. PostgreSQL crashed, and Redis got overwhelmed by the retries.
+
+**The Fix:**
+1. **Cache Warming (The permanent fix):** Before shifting traffic to a new model, we run a background Airflow job that iterates through our active user base and computes/writes the new features to Redis *before* the model goes live.
+2. **Probabilistic Early Expiration (PER):** To prevent existing features from stampeding when their TTL expires, we use an algorithm where a feature randomly refreshes itself slightly *before* its TTL actually expires.
+3. **Canary Deployments:** If we had rolled out the model to 1% of traffic first, the cache misses would have been a slow trickle, easily absorbed by the database and gracefully populating Redis.
+
+---
+
+## Q6: Your data scientists are raising false alarms saying "Data Drift is detected!" every single Monday. Why, and how do you fix it?
+
+**Real-world context:**
+We implemented Evidently AI to monitor data drift. Every Monday morning at 8 AM, it sent a high-priority Slack alert that the feature distributions had drifted wildly. By 2 PM, the alert would magically clear itself.
+
+**Answer:**
+
+**Root Cause Analysis:**
+The drift detection was comparing the *last 1 hour* of production data against the *entire training dataset*.
+The model was a B2B SaaS pricing model. On weekends, traffic was practically zero. On Monday morning at 8 AM, traffic was entirely composed of early-bird European users, who had different behavioral features than the global average. 
+The data hadn't drifted; the monitoring system was just detecting natural, expected weekly seasonality.
+
+**The Fix:**
+Data drift monitoring for ML models cannot use static 1-hour windows if the business has strong seasonality.
+1. **Align the windows:** We changed the reference window. Instead of comparing "Last 1 Hour" vs "Training Data", we compared "Last 24 Hours" vs "Same 24 Hours Last Week". 
+2. **Increase the batch size:** Drift metrics (like PSI or K-S tests) are statistically invalid on small sample sizes. If Monday morning only had 500 requests, the variance was huge. We enforced a minimum threshold: do not calculate drift until at least 10,000 predictions have been collected. 
 
 ---
 *[Back to README](../README.md)*
