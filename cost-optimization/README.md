@@ -1,87 +1,121 @@
 # Cost Optimization for ML - Interview Questions
 
-## Q1: How do you control infrastructure costs for ML training and serving on Kubernetes?
+## Q1: How do you control infrastructure costs for ML training on Kubernetes?
+**Context:** AWS bill jumped 40% due to hyperparameter sweeps.
+**Answer:** Move all training jobs to Spot/Preemptible nodes. This provides a ~70% discount. Ensure training code checkpoints to S3 frequently so it can resume if the Spot instance is terminated.
 
-**Real-world context:**
-Our AWS EC2 bill jumped 40% in one month after the data science team started hyperparameter tuning on GPU nodes. I was tasked with bringing the cost down without impacting their delivery timelines.
+## Q2: How do you optimize serving costs for bursty ML traffic?
+**Context:** GPU nodes idling overnight.
+**Answer:** Do not use Spot for real-time serving (causes 503 errors). Use Reserved Instances (1-year commit) for the baseline traffic. Use KEDA to "Scale to Zero" during off-hours, allowing Cluster Autoscaler to terminate the idle nodes.
 
-**Answer:**
+## Q3: Batch vs Real-time inference: What are the cost implications?
+**Context:** PM wants real-time predictions for a weekly email.
+**Answer:** Real-time requires 24/7 Highly Available compute and a costly Redis feature store. Batch runs ephemerally (e.g., 2 hours on Spot instances) at 100% utilization. Always push for Batch or Micro-batch unless sub-second latency is a hard business requirement.
 
-Cost optimization on K8s for ML requires attacking the problem at three levels: Compute type, Autoscaling, and Resource Allocation.
+## Q4: How do you attribute ML costs back to specific teams or models?
+**Context:** Finance needs ROI per data science team.
+**Answer:** Enforce K8s labels (`team`, `model`). Deploy Kubecost to map AWS billing data back to specific pods based on GPU request time. Build a Grafana dashboard showing "Daily Inference Spend by Model".
 
-**1. Compute Type: Spot Instances (The 70% discount)**
-*   **Training:** Training jobs are perfect for Spot instances because they are asynchronous and can survive interruptions *if* checkpointing is implemented. I moved all our Kubeflow/PyTorch training jobs to a Spot node pool. If a node is preempted, the job restarts on a new node and resumes from the last S3 checkpoint.
-*   **Serving:** NEVER use Spot instances for real-time, synchronous inference. You will get 503 errors during node termination. For serving, we use Reserved Instances (1-year commit) which saves ~30% compared to On-Demand.
+## Q5: How do you prevent resource fragmentation on K8s?
+**Context:** Devs requesting 1 entire A100 GPU for a 2GB model.
+**Answer:** Implement NVIDIA Time-Slicing or MIG (Multi-Instance GPU) to partition the GPU. Pack multiple small inference services onto a single physical GPU, drastically increasing utilization.
 
-**2. Intelligent Autoscaling (Scale to Zero)**
-*   **The Problem:** GPU nodes sitting idle overnight.
-*   **The Fix (KEDA + Cluster Autoscaler):** We use KEDA (Kubernetes Event-driven Autoscaling) for our async batch inference workloads. When the Kafka queue is empty, KEDA scales the Deployment to 0 replicas. The Kubernetes Cluster Autoscaler then sees empty GPU nodes and terminates them. When messages arrive in Kafka, KEDA scales the deployment to 1, the Cluster Autoscaler requests a new GPU node from AWS, and processing begins.
+## Q6: How do you reduce S3/Storage costs in ML?
+**Context:** 5PB of old training data and checkpoints costing thousands.
+**Answer:** Implement S3 Lifecycle Policies. Transition raw datasets to S3 Glacier/Infrequent Access after 30 days. Automatically delete intermediate training checkpoints (keeping only the final model) after 7 days.
 
-**3. Resource Allocation & Right-sizing**
-*   **The Problem:** Data scientists requesting `nvidia.com/gpu: 1` and `memory: 64Gi` for every pod, regardless of the model size, leading to massive cluster fragmentation and wasted capacity.
-*   **The Fix:** 
-    *   I implemented Datadog monitoring on actual pod utilization vs. requested limits.
-    *   I enforced strict `LimitRanges` and `ResourceQuotas` per namespace.
-    *   For smaller models (e.g., XGBoost), we strictly enforce CPU-only inference.
-    *   For GPU inference, we use NVIDIA time-slicing to pack multiple smaller models onto a single A10G GPU, sharing the hardware rather than giving each model a dedicated GPU.
+## Q7: Optimizing Cloud Egress Costs.
+**Context:** Massive egress fees moving data from AWS to GCP.
+**Answer:** Keep training compute in the same cloud and region as the data gravity. If using multi-cloud, use AWS Direct Connect. Ensure training pods pull data from S3 using VPC Endpoints to avoid traversing the public NAT Gateway.
 
----
+## Q8: Right-sizing EC2 instances for ML.
+**Context:** Using expensive GPU instances for data prep.
+**Answer:** Split pipelines. Run the Pandas/Spark data preprocessing step on cheap, memory-optimized CPU instances (R5). Only spin up the GPU instance (P4) for the actual matrix multiplication training phase.
 
-## Q2: Batch vs Real-time inference: What are the cost implications?
+## Q9: How do you handle Zombie ML Resources?
+**Context:** Forgotten Jupyter notebooks running on A100s for weeks.
+**Answer:** Implement a Reaper script. Scan K8s namespaces for Jupyter pods with 0% GPU utilization over the last 48 hours. Automatically scale their deployment to 0 and send a Slack notification to the owner.
 
-**Real-world context:**
-A product manager requested a real-time recommendation endpoint. I analyzed the traffic and found that 95% of users only visit the site once a week.
+## Q10: FinOps: How do you forecast ML infrastructure costs?
+**Context:** Budgeting for a new deep learning project.
+**Answer:** Estimate: (Hours to train 1 epoch) * (Total Epochs) * (Cost per GPU instance hour). Add 20% buffer for hyperparameter tuning. For inference: (Expected TPS / Max TPS per Pod) * (Cost per Pod instance).
 
-**Answer:**
+## Q11: Using AWS Inferentia / Graviton for Cost Savings.
+**Context:** Reducing reliance on NVIDIA GPUs.
+**Answer:** Migrate CPU-bound ML (XGBoost) to ARM-based Graviton instances for a 20% price-performance gain. Migrate Deep Learning inference to AWS Inferentia chips for a massive cost reduction compared to standard T4/A10G GPUs.
 
-Real-time inference is exponentially more expensive than batch inference. I always advocate for batch inference unless sub-second latency is a hard business requirement.
+## Q12: How do you optimize Feature Store costs?
+**Context:** Redis cluster costs exceeding the ML compute costs.
+**Answer:** Only put strictly necessary real-time features in Redis. Serve historical, slowly-changing features directly from an offline store or a cheaper DB like PostgreSQL. Implement aggressive TTLs (Time-to-Live) so stale features are evicted from RAM.
 
-**Cost breakdown:**
+## Q13: Cost implications of Deep Learning vs Traditional ML.
+**Context:** Deciding model architecture.
+**Answer:** XGBoost/LightGBM runs on CPUs (cheap), trains fast, and is easily interpretable. Deep Learning requires GPUs (expensive). Unless dealing with unstructured data (images/text) or massive datasets, default to tree-based models to save money.
 
-**Real-time Inference (High Cost):**
-*   Requires 24/7 compute availability. Even at 3 AM, you need at least 2 pods running across 2 availability zones for high availability.
-*   Requires a low-latency, highly available online Feature Store (like Redis Cluster), which adds significant infrastructure cost.
-*   Requires complex load balancing, Istio/service mesh, and HPA overhead.
-*   **Efficiency:** Often runs at 20-30% utilization due to the need to over-provision for traffic spikes.
+## Q14: Optimizing API Gateway costs for ML.
+**Context:** Paying high fees for AWS API Gateway on high-throughput ML models.
+**Answer:** API Gateway charges per million requests. For an internal microservice doing 10k TPS, API Gateway is too expensive. Use Application Load Balancers (ALB) or internal K8s ingress (NGINX/Istio) which charge by hourly usage/bandwidth, not per request.
 
-**Batch Inference (Low Cost):**
-*   Compute is ephemeral. You spin up a massive Spark cluster (using Spot instances), score 10 million users in 2 hours, write the predictions to a database (PostgreSQL/DynamoDB), and terminate the cluster.
-*   No online Feature Store required. You query the data lake (S3/BigQuery) directly.
-*   **Efficiency:** Runs at nearly 100% CPU/GPU utilization for the duration of the job, getting maximum value out of the hardware.
+## Q15: How do you enforce ML cost budgets?
+**Context:** Junior DS spent $5k over the weekend.
+**Answer:** Use AWS Budgets to trigger alerts at 50%, 80%, and 100% of the team's monthly limit. Integrate an OPA Gatekeeper policy in K8s that rejects jobs if the namespace has exceeded its predefined resource quota.
 
-**The Compromise (Near real-time):**
-If they need freshness but not millisecond latency, I build a micro-batch streaming pipeline using Flink or Spark Structured Streaming running every 15 minutes. It's cheaper than a REST endpoint and fresher than a nightly batch job.
+## Q16: Optimizing Distributed Training network costs.
+**Context:** High costs for cross-AZ network traffic during training.
+**Answer:** Distributed training requires massive node-to-node communication. Ensure all training worker nodes are deployed in the *same* Availability Zone using an EC2 Placement Group to completely eliminate cross-AZ network transfer fees.
 
----
+## Q17: Cost vs Latency trade-off in batching.
+**Context:** Triton Inference Server configuration.
+**Answer:** Dynamic batching increases throughput (saving money on GPUs) but increases latency (waiting for the batch to fill). You must tune `max_queue_delay_microseconds` to find the exact breakeven point where SLA is met at the lowest cost.
 
-## Q3: How do you track and attribute ML costs to specific models or teams?
+## Q18: Optimizing Docker Image storage costs.
+**Context:** ECR storage costs ballooning.
+**Answer:** ML images are huge (5GB+). If CI/CD builds a new image on every commit, costs explode. Set an ECR Lifecycle Policy to keep only the last 10 tagged images, and delete untagged/orphaned images after 14 days.
 
-**Real-world context:**
-Finance asked me, "How much does the Fraud Detection model cost to run versus the Recommendation model?" because we needed to calculate the ROI of the data science teams. I couldn't answer them because everything was running in one giant EKS cluster.
+## Q19: Using Spot Fleets / Mixed Instance Groups.
+**Context:** Spot instances getting terminated frequently.
+**Answer:** Don't rely on a single instance type (e.g., only `p3.2xlarge`). Configure an ASG Mixed Instance Group to pull from multiple pools (`p3.2xlarge`, `g4dn.xlarge`). If one pool runs out of Spot capacity, AWS automatically fulfills from another pool.
 
-**Answer:**
+## Q20: Optimizing Data Labeling costs.
+**Context:** Paying humans $100k to label images.
+**Answer:** Implement Active Learning. Use a baseline model to score the unlabelled data. Only send the images where the model is highly uncertain (probability near 50%) to the expensive human labelers. Auto-label the highly confident ones.
 
-You cannot optimize what you cannot measure. K8s obfuscates costs because multiple models share the same underlying EC2 instances.
+## Q21: Cost of Model Monitoring (Datadog/ELK).
+**Context:** Logging 100% of predictions doubled the Datadog bill.
+**Answer:** ML logs are high volume. Do not send raw prediction JSONs to Datadog. Send them to S3 (cheap). Only send aggregated metrics (averages, error counts) to Datadog.
 
-**My Cost Attribution Strategy:**
+## Q22: Should you compress ML models?
+**Context:** Model is 4GB, requires expensive instances.
+**Answer:** Yes. Use Quantization (FP32 to INT8) via TensorRT or PyTorch native. This shrinks the model size by 4x, allowing you to run it on cheaper instances with less VRAM, often with negligible accuracy loss.
 
-1.  **Strict Labeling & Namespaces:** Every K8s deployment must have `team`, `model_name`, and `environment` labels. I enforce this using an OPA Gatekeeper policy (if you submit a pod without these labels, K8s rejects it).
-2.  **Kubecost / Datadog Cloud Cost Management:** We deployed Kubecost inside the cluster. It maps the AWS/GCP billing data back to specific K8s pods based on CPU/GPU request time and labels.
-3.  **MLflow Cost Tagging:** For training jobs, we calculate the cost heuristically inside the training script and log it as a metric in MLflow.
-    ```python
-    import time
-    start = time.time()
-    # ... train model ...
-    duration_hours = (time.time() - start) / 3600
-    cost_per_hour = 3.06 # cost of p3.2xlarge
-    mlflow.log_metric("training_cost_usd", duration_hours * cost_per_hour)
-    ```
-4.  **Dashboards:** I built a Datadog dashboard for the Director of Data Science showing:
-    *   Daily training spend per team.
-    *   Daily inference spend per model.
-    *   Idle GPU waste (nodes running but pods utilizing <10% GPU).
+## Q23: Avoiding Cloud NAT Gateway charges.
+**Context:** Training nodes downloading terabytes from public PyPI/HuggingFace.
+**Answer:** NAT Gateways charge per GB processed. Use a private JFrog Artifactory inside your VPC to cache Python packages. Use VPC Endpoints for AWS services to avoid the NAT entirely.
 
-By exposing the costs directly to the data scientists via MLflow and Grafana, they naturally started optimizing their own hyperparameter sweeps because they had a budget constraint.
+## Q24: Cost of High Availability (HA) in MLOps.
+**Context:** Running 3 redundant feature stores.
+**Answer:** HA doubles or triples costs. Does a churn prediction model really need 99.99% uptime across 3 AZs? Tier your services. Tier 1 (Fraud/Payments) gets HA. Tier 3 (Internal analytics) runs in a single AZ with acceptable downtime.
 
----
-*[Back to README](../README.md)*
+## Q25: Optimizing CI/CD compute costs.
+**Context:** GitHub Actions burning minutes on long ML builds.
+**Answer:** Use Self-Hosted Runners deployed on Spot instances within your own AWS account. You only pay the raw EC2 Spot price, bypassing GitHub's per-minute premium billing.
+
+## Q26: Managing unused K8s Persistent Volumes (PVs).
+**Context:** Orphaned EBS volumes costing $1k/month.
+**Answer:** When data scientists delete a Jupyter pod, the PVC sometimes remains. Run a weekly script to find and delete "Unbound" or orphaned PVs.
+
+## Q27: Evaluating managed ML platform costs (e.g., Databricks vs EMR).
+**Context:** Choosing a Spark platform for feature engineering.
+**Answer:** Databricks charges a DBU (Databricks Unit) premium on top of raw AWS compute. If the team uses the collaborative notebooks and MLflow integrations heavily, it's worth it. If they just run scheduled batch jobs, raw EMR is significantly cheaper.
+
+## Q28: How do you identify inefficient ML code?
+**Context:** Python script taking 10 hours to process data.
+**Answer:** Inefficient Python code burns expensive compute time. Use profilers (`cProfile`). Often, a simple Pandas `apply()` loop can be replaced with a vectorized NumPy operation, dropping runtime from hours to minutes.
+
+## Q29: Optimizing Kafka costs for ML streams.
+**Context:** Storing 7 days of ML feature streams in MSK.
+**Answer:** Kafka storage is expensive. Reduce the retention period to 24 hours. Use Kafka Connect to sink older data into S3/Parquet for cheap long-term storage and historical replay.
+
+## Q30: The hidden cost of Technical Debt in MLOps.
+**Context:** Why invest in automation?
+**Answer:** Manual deployments take 2 engineers 3 days. Automated CI/CD takes 5 minutes. The cost of an MLOps platform engineer is high, but the ROI is massive when you eliminate the manual toil of 50 data scientists.
