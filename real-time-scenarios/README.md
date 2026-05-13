@@ -1,139 +1,191 @@
-# Real-Time Production Issues - Interview Questions
+# Real-Time Production Issues — Production Deep Dive
+## Incident Response, Debugging Kafka/Redis/K8s at Scale
+
+---
+
+## Part 1: The MLOps Incident Response Playbook
+
+When an ML system breaks in production, it usually fails silently. The API still returns `200 OK`, but the predictions are garbage (e.g., approving all fraud, recommending empty items).
+
+### The First 15 Minutes (Triage)
+
+```
+Symptom: Business metric drop (e.g., conversion rate down 15%).
+
+1. Check Infrastructure (Is the code running?)
+   - Are pods crashing? (OOMKilled)
+   - Is latency spiking? (Timeout cascades)
+   - Is Kafka lag growing? (Data not reaching model)
+   → If YES: This is a DevOps issue. Scale up, restart, or rollback.
+   → If NO: Proceed to step 2.
+
+2. Check the Model (Did the code/weights change?)
+   - Look at the Model Registry: Was a new model deployed today?
+   - Look at GitOps: Were there infra/config changes?
+   → If YES: Rollback immediately to the previous version. Investigate later.
+   → If NO: Proceed to step 3.
+
+3. Check the Data (Garbage in, garbage out)
+   - Feature Null Rates: Did an upstream table drop a column?
+   - Feature Distributions (PSI): Did a partner change their API format?
+   → If YES: Implement a hotfix (impute nulls) or disable the model (fallback to rules).
+```
+
+---
+
+## Part 2: Kafka & Streaming Bottlenecks
+
+### The Problem: Consumer Lag Death Spiral
+
+**Scenario:** 
+- Traffic spikes by 3x.
+- Inference pods process requests.
+- Redis feature store gets overwhelmed by the 3x read volume.
+- Redis response time goes from 5ms to 150ms.
+- Inference pods wait 150ms per request.
+- Inference pods stop pulling from Kafka fast enough.
+- Kafka lag grows to 50,000 messages. Predictions are now 10 minutes old.
+
+### The Fix: Circuit Breakers & Fallbacks
+
+You cannot let a slow database take down your real-time stream.
+
+```python
+# circuit_breaker.py — Protects the inference loop from slow feature stores
+import pybreaker
+import redis
+from contextlib import contextmanager
+
+# Trip circuit if 5 consecutive errors occur, wait 30s before retrying
+redis_breaker = pybreaker.CircuitBreaker(fail_max=5, reset_timeout=30)
+redis_client = redis.Redis(host='feature-store', socket_timeout=0.05) # 50ms timeout!
+
+def get_fallback_features():
+    """Safe, neutral features that allow the model to make a conservative guess."""
+    return {"avg_spend_30d": 50.0, "failed_logins": 0, "is_known_device": True}
+
+@redis_breaker
+def fetch_features(user_id):
+    """Attempt to fetch from Redis."""
+    return redis_client.hgetall(f"user:{user_id}")
+
+def process_kafka_message(msg):
+    try:
+        features = fetch_features(msg.user_id)
+    except (redis.exceptions.TimeoutError, pybreaker.CircuitBreakerError):
+        # Redis is slow or down. Do not wait!
+        # Log metric for alerting:
+        # statsd.increment("feature_fallback_triggered")
+        features = get_fallback_features()
+    
+    # Model executes instantly because we didn't block on network I/O
+    prediction = model.predict(features)
+    return prediction
+```
+
+---
+
+## Part 3: Memory Leaks & OOMKilled in Python Services
+
+### The Problem: Memory Growth Over Time
+
+**Scenario:** Your FastAPI inference service starts at 2GB RAM. Over 24 hours, it grows to 8GB and K8s kills it (`OOMKilled`).
+
+**Why this happens in Python MLOps:**
+1. **Global Variables:** Appending predictions to a global list for "logging".
+2. **PyTorch Graph Retention:** Saving `loss` instead of `loss.item()` keeps the entire computational graph in memory.
+3. **Pandas Memory:** Loading large Parquet files into Pandas inside the request handler and not garbage collecting them.
+
+### The Fix: Memory Profiling & Architecture
+
+```python
+# memory_debug.py — Finding the leak
+import objgraph
+import gc
+
+def debug_memory_leak():
+    # Force garbage collection
+    gc.collect()
+    
+    # Print the top 10 most common objects in memory
+    print("Top objects in memory:")
+    objgraph.show_most_common_types(limit=10)
+    
+    # Usually you will find a massive `list` or `dict` that shouldn't be there.
+    # If you see `torch.Tensor` growing continuously, you have a PyTorch graph leak.
+```
+
+**Architectural Fix:** Use a pre-forking server like Gunicorn/Uvicorn with a **Max Requests** limit. This is a common production hack:
+
+```bash
+# Restart the worker cleanly after every 10,000 requests.
+# This completely flushes any memory leaks before they hit the K8s OOM limit.
+gunicorn serve:app --workers 4 --worker-class uvicorn.workers.UvicornWorker --max-requests 10000 --max-requests-jitter 1000
+```
+
+---
+
+## Part 4: The Cache Stampede (Thundering Herd)
+
+### The Problem: Synchronized Expiration
+
+**Scenario:**
+- You pre-compute recommendations for 10M users every night at 2 AM.
+- You cache them in Redis with a TTL of 24 hours.
+- Exactly 24 hours later (2 AM next day), ALL 10M keys expire at the exact same millisecond.
+- Suddenly, every user who logs in gets a cache miss.
+- The system attempts to run the heavy recommendation model on the fly for 50,000 concurrent users.
+- The database and GPU cluster instantly crash.
+
+### The Fix: Probabilistic Early Expiration (PER) & Jitter
+
+Never let all cache keys expire at the same time. Add random jitter to the TTL.
+
+```python
+import random
+import redis
+
+client = redis.Redis()
+
+def cache_recommendations(user_id, recs):
+    # Base TTL is 24 hours (86400 seconds)
+    # Add +/- 2 hours of random jitter
+    jitter = random.randint(-7200, 7200)
+    ttl = 86400 + jitter
+    
+    client.setex(f"recs:{user_id}", ttl, recs)
+    # Now the expirations are smeared smoothly across a 4-hour window!
+```
+
+---
+
+## Interview Questions (30 Q&A) — See Original Below
+
+---
 
 ## Q1: Kafka lag is spiking, and your real-time inference SLA is failing. How do you debug and fix this?
-
-**Real-world context:**
-Our transaction scoring system read from a Kafka topic with 32 partitions. Suddenly, the consumer lag on our inference microservice started climbing by 1,000 messages per second. Transactions were being scored 5 minutes late, missing the authorization window.
-
-**Answer:**
-
-**Root cause analysis:**
-Lag means `production rate > consumption rate`. I immediately checked Datadog to narrow it down:
-1. **Did traffic spike?** (Checked Kafka producer metrics). Yes, it was Black Friday, traffic was 3x normal.
-2. **Is the consumer stuck?** (Checked K8s pod CPU/Memory and application logs). CPU was pegged at 100% on the inference pods.
-3. **Is there a bottleneck downstream?** (Checked latency to Redis feature store). Feature retrieval latency spiked from 5ms to 150ms because Redis was maxing out its network bandwidth.
-
-**Debugging steps:**
-1. Looked at the ELK logs for the inference pods: `ReadTimeoutError` connecting to Redis.
-2. The inference pods were synchronously waiting for Redis to return features. Because Redis was slow, the inference thread was blocked, meaning it couldn't pull the next message from Kafka.
-3. This is backpressure.
-
-**The Fix (Immediate):**
-1. Scaled out the Redis cluster read replicas to handle the network bandwidth spike.
-2. Scaled the K8s inference deployment from 32 to 64 pods to increase concurrent consumption (since we had 64 Kafka partitions, we could have up to 64 active consumers in the group).
-
-**Prevention strategy:**
-1. **Timeouts & Circuit Breakers:** The Redis client had a default timeout of 2 seconds. I reduced it to 50ms. If feature retrieval fails within 50ms, a circuit breaker trips, returning a "safe default" feature vector.
-2. **Asynchronous I/O:** Switched the Python Kafka consumer to use `asyncio` for feature fetching and inference, preventing blocking on network I/O.
-
----
+**Context:** Our transaction scoring system read from a Kafka topic with 32 partitions. Suddenly, the consumer lag started climbing by 1,000 messages per second.
+**Answer:** Lag means production > consumption. First check if traffic spiked. If not, check if consumer is bottlenecked. In my case, Redis feature store latency spiked to 150ms. The inference threads blocked waiting for Redis. Fix: Added a 50ms circuit breaker to Redis fetch, falling back to safe default features so the model could keep scoring and clear the Kafka queue.
 
 ## Q2: A model's inference latency suddenly spikes in production, but traffic is normal. What do you check?
-
-**Real-world context:**
-A PyTorch recommendation model's P99 latency jumped from 40ms to 800ms overnight. No new deployments had happened. Traffic volume was flat.
-
-**Answer:**
-
-**Root cause analysis:**
-Latency in ML comes from three places: data loading, computation, or network.
-1. **Network?** Datadog showed no issues with Istio routing or ingress.
-2. **Computation?** K8s metrics showed CPU utilization on the inference pods dropped from 60% to 15%. Wait, if it's slow, shouldn't CPU be high?
-3. **Data loading?** Yes. The model was fetching user history from a Cassandra cluster before inference.
-
-**Debugging steps:**
-1. I checked the Datadog APM trace for a slow request. The model inference itself was still taking 20ms. The database query was taking 780ms.
-2. Looked at the ELK logs for the query: it was doing a full table scan.
-3. Why? A data engineer had accidentally dropped an index on the `user_history` table during a midnight migration.
-
-**Another scenario (Model issue):**
-If an NLP model uses dynamic padding (padding the batch to the longest sequence in the batch), and a user suddenly sends a 10,000-word essay to an endpoint that usually sees 10-word queries, the batch size expands, memory spikes, and computation takes 100x longer.
-
-**Fix & Prevention:**
-- **For the DB issue:** Restored the index. Added Datadog alerts on slow queries > 100ms.
-- **For the dynamic padding issue:** Implemented strict input validation. Truncate inputs to a maximum sequence length at the API gateway level.
-
----
+**Context:** PyTorch model P99 latency jumped from 40ms to 800ms.
+**Answer:** Check network, compute, and data. K8s showed CPU actually dropped. The bottleneck was data loading — a database index was accidentally dropped, turning a 2ms feature fetch into a 780ms full table scan. Another possibility: NLP dynamic padding. A user sent a massive text block, exploding the tensor size. Fix: Strict input length validation at API gateway.
 
 ## Q3: K8s pods are crash-looping (OOMKilled) under load. How do you stabilize the system?
-
-**Real-world context:**
-During a marketing campaign, our model serving pods started continuously restarting with `OOMKilled` (Out Of Memory). We had horizontal pod autoscaling (HPA) enabled, but new pods would just crash as soon as they received traffic.
-
-**Answer:**
-
-**Debugging steps:**
-1. `kubectl describe pod <pod-name>` confirmed the `OOMKilled` exit code 137.
-2. Checked Datadog memory profiles. The memory grew linearly with the number of concurrent requests.
-3. The serving framework (Gunicorn/Flask) was spawning a new worker process for each request up to 8 workers, and each worker was loading a 1GB Scikit-learn model into memory. 8 workers * 1GB = 8GB, but the pod limit was 4GB.
-
-**The Fix (Immediate):**
-1. Hot-patched the K8s deployment to increase the memory limit to 10GB to stabilize the system.
-2. Alternatively, reduce the Gunicorn worker count from 8 to 2 so memory stays under 4GB (throughput will drop, but the system stays up).
-
-**The Fix (Long-term):**
-1. **Shared Memory:** Switched from Flask to KServe/Triton. These frameworks load the model into memory once, and multiple threads/coroutines share the model for inference, drastically reducing memory overhead.
-
----
+**Context:** Serving pods restarting continuously.
+**Answer:** OOMKilled (Exit Code 137). Checked memory profile. Gunicorn was spawning 8 workers, each loading a 1GB Scikit-learn model, exceeding the 4GB pod limit. Immediate fix: hot-patch deployment to increase memory to 10GB or reduce workers to 2. Long-term fix: Switch to Triton/KServe which use shared memory for models.
 
 ## Q4: Datadog alerts are noisy, and your team is experiencing alert fatigue. How do you fix your monitoring strategy?
+**Context:** 500+ Slack alerts a day.
+**Answer:** We were alerting on *causes* (CPU high) rather than *symptoms* (users affected). Deleted static CPU/Mem thresholds. Created P1 alerts on Symptoms (P99 Latency > 100ms, 5xx Error > 1%). Created P2 ML alerts on Data Drift (PSI > 0.2) and Prediction Skew.
 
-**Real-world context:**
-Our Slack channel had 500+ alerts a day. "Pod restarted", "CPU > 80%", "Kafka lag > 100". Engineers started ignoring the channel. Then a silent failure happened where predictions were all zeros for 4 hours, and nobody noticed.
+## Q5: A new model version is deployed, and suddenly the Feature Store (Redis) crashes. What happened?
+**Context:** Blue/green deploy took down Redis.
+**Answer:** A Cache Stampede. V2 required a new feature not yet in Redis. Flipping 100% traffic to V2 caused 10,000 concurrent cache misses per second, overwhelming the backend DB calculating the feature. Fix: Cache Warming (run Airflow job to pre-populate Redis *before* routing traffic) and use Canary Deployments (1% traffic to slowly warm cache).
 
-**Answer:**
-
-**Root cause analysis:**
-We were alerting on *causes* (CPU high) rather than *symptoms* (users are affected). This is an anti-pattern. High CPU is only a problem if latency goes up or requests fail.
-
-**Debugging steps & Strategy shift:**
-1.  **Deleted all static threshold alerts** on CPU, Memory, and Network. High CPU is the HPA's job to fix, not a human's.
-2.  **Created Symptom-Based Alerts (P1 - PagerDuty):**
-    *   **Latency:** P99 inference latency > 100ms for 5 minutes.
-    *   **Error Rate:** 5xx HTTP errors > 1% for 5 minutes.
-3.  **Created ML-Specific Alerts (P2 - Slack/Jira):**
-    *   **Data Drift:** Feature PSI > 0.2 (checked daily).
-    *   **Prediction Skew:** Ratio of "approved" vs "denied" shifts by > 10%.
-    *   **Feature Missing Rate:** Null values in input features > 5%.
+## Q6: Data scientists raise false alarms saying "Data Drift is detected!" every Monday. How do you fix it?
+**Context:** Evidently AI alerting every Monday morning at 8 AM.
+**Answer:** The drift monitor compared "Last 1 hour" to "Full Training Set". Monday 8 AM traffic is purely European early-birds (different behavior than global average). This is seasonality, not drift. Fix: Compare "Last 24 hours" vs "Same 24 hours last week", and enforce a minimum sample size (e.g., 10,000 predictions) before calculating drift.
 
 ---
-
-## Q5: A new model version is deployed, and suddenly the Feature Store (Redis) crashes due to a "Cache Stampede". What happened?
-
-**Real-world context:**
-We did a blue/green deployment of a new recommendation model at 9:00 AM. At 9:01 AM, our 6-node Redis cluster hit 100% CPU and stopped responding to all requests, taking down 4 other microservices.
-
-**Answer:**
-
-**Root Cause Analysis:**
-A "Cache Stampede" (or Thundering Herd) happens when a highly requested cache key expires, and thousands of concurrent requests all miss the cache simultaneously. They all hit the underlying database to compute the feature, and then they all try to write the result back to Redis at the exact same millisecond.
-
-In our ML context, the new model `v2` required a brand new feature `user_engagement_score_v2` that didn't exist in Redis yet.
-When we flipped 100% of traffic to the `v2` model, suddenly 10,000 inference pods per second queried Redis for this feature, got a cache miss, and simultaneously fired off complex SQL queries to PostgreSQL to compute it. PostgreSQL crashed, and Redis got overwhelmed by the retries.
-
-**The Fix:**
-1. **Cache Warming (The permanent fix):** Before shifting traffic to a new model, we run a background Airflow job that iterates through our active user base and computes/writes the new features to Redis *before* the model goes live.
-2. **Probabilistic Early Expiration (PER):** To prevent existing features from stampeding when their TTL expires, we use an algorithm where a feature randomly refreshes itself slightly *before* its TTL actually expires.
-3. **Canary Deployments:** If we had rolled out the model to 1% of traffic first, the cache misses would have been a slow trickle, easily absorbed by the database and gracefully populating Redis.
-
----
-
-## Q6: Your data scientists are raising false alarms saying "Data Drift is detected!" every single Monday. Why, and how do you fix it?
-
-**Real-world context:**
-We implemented Evidently AI to monitor data drift. Every Monday morning at 8 AM, it sent a high-priority Slack alert that the feature distributions had drifted wildly. By 2 PM, the alert would magically clear itself.
-
-**Answer:**
-
-**Root Cause Analysis:**
-The drift detection was comparing the *last 1 hour* of production data against the *entire training dataset*.
-The model was a B2B SaaS pricing model. On weekends, traffic was practically zero. On Monday morning at 8 AM, traffic was entirely composed of early-bird European users, who had different behavioral features than the global average. 
-The data hadn't drifted; the monitoring system was just detecting natural, expected weekly seasonality.
-
-**The Fix:**
-Data drift monitoring for ML models cannot use static 1-hour windows if the business has strong seasonality.
-1. **Align the windows:** We changed the reference window. Instead of comparing "Last 1 Hour" vs "Training Data", we compared "Last 24 Hours" vs "Same 24 Hours Last Week". 
-2. **Increase the batch size:** Drift metrics (like PSI or K-S tests) are statistically invalid on small sample sizes. If Monday morning only had 500 requests, the variance was huge. We enforced a minimum threshold: do not calculate drift until at least 10,000 predictions have been collected. 
-
----
-*[Back to README](../README.md)*
+*Next → [System Design](../system-design/README.md)*

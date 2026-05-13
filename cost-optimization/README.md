@@ -1,4 +1,172 @@
-# Cost Optimization for ML - Interview Questions
+# Cost Optimization for ML — Production Deep Dive
+## FinOps, Spot Strategies, Scale-to-Zero, Right-sizing
+
+---
+
+## Part 1: The ML Cost Anatomy — Where Does the Money Go?
+
+In a typical enterprise ML platform, cost breaks down roughly like this:
+
+1. **Training Compute (40%)**: Heavy GPU instances (P4/A100) running for hours/days.
+2. **Inference Compute (35%)**: Always-on instances (T4/G4dn) running 24/7 to meet low-latency SLAs.
+3. **Data Storage & Transfer (15%)**: S3 buckets, cross-AZ data transfer during distributed training.
+4. **Feature Store (10%)**: In-memory Redis clusters for sub-millisecond feature retrieval.
+
+**The Golden Rule of ML FinOps:** Every optimization must be weighed against engineering time. Saving $500/month by spending 2 weeks of a $200k/yr engineer's time is a net negative. Focus on the high-leverage architectural changes.
+
+---
+
+## Part 2: Training Optimization — How to Cut 70% of Costs
+
+### 1. The Spot Instance Architecture (Mandatory for Training)
+
+Spot instances are spare compute capacity sold at a massive discount (up to 90%), but the cloud provider can terminate them with a 2-minute warning.
+
+**How to survive Spot interruptions:**
+- Your training loop MUST implement **frequent checkpointing**.
+- Use PyTorch Lightning or native PyTorch `torch.save()`.
+
+```python
+# spot_training.py — Resilient training loop for Spot instances
+import os
+import torch
+
+CHECKPOINT_PATH = "s3://ml-checkpoints/fraud-model/latest.pt"
+
+def load_checkpoint_if_exists(model, optimizer):
+    """Resume from the exact epoch we were killed on."""
+    # Note: In production, download from S3 to local disk first
+    if os.path.exists("local_latest.pt"):
+        checkpoint = torch.load("local_latest.pt")
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        print(f"Resumed from epoch {start_epoch}")
+        return start_epoch
+    return 0
+
+def train():
+    model = MyModel().cuda()
+    optimizer = torch.optim.Adam(model.parameters())
+    
+    start_epoch = load_checkpoint_if_exists(model, optimizer)
+    
+    for epoch in range(start_epoch, 100):
+        # ... training logic ...
+        
+        # Save state at the end of EVERY epoch
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+        }, "local_latest.pt")
+        # In production, async upload local_latest.pt to S3 here
+```
+
+### 2. Node Auto-Provisioning (Karpenter)
+
+Instead of a fixed Auto Scaling Group, use Karpenter to provision the exact right instance type just-in-time.
+
+```yaml
+# karpenter-provisioner.yaml
+apiVersion: karpenter.sh/v1alpha5
+kind: Provisioner
+metadata:
+  name: gpu-spot-provisioner
+spec:
+  requirements:
+    - key: karpenter.sh/capacity-type
+      operator: In
+      values: ["spot"]
+    - key: node.kubernetes.io/instance-type
+      operator: In
+      # Allow Karpenter to pick from any of these based on availability/price
+      values: ["p3.2xlarge", "g4dn.2xlarge", "g5.2xlarge"]
+  limits:
+    resources:
+      cpu: 1000
+      nvidia.com/gpu: 20  # Hard cost cap
+```
+
+---
+
+## Part 3: Inference Optimization — Paying Only for What You Use
+
+### 1. Scale-to-Zero with KEDA (Batch & Async Inference)
+
+If your model processes a queue (e.g., scoring uploaded documents), it should consume **zero resources** when the queue is empty.
+
+```yaml
+# keda-scaled-object.yaml
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: document-scoring-scaler
+  namespace: ml-serving
+spec:
+  scaleTargetRef:
+    name: document-scoring-worker
+  minReplicaCount: 0       # COST SAVINGS: Scale to 0 when idle!
+  maxReplicaCount: 10
+  cooldownPeriod: 300      # Wait 5 mins before scaling down to prevent flapping
+  triggers:
+  - type: aws-sqs-queue
+    metadata:
+      queueURL: https://sqs.us-east-1.amazonaws.com/123/doc-queue
+      queueLength: "50"    # Add 1 pod for every 50 messages in backlog
+```
+
+### 2. The Multi-Model Server (Triton)
+
+**The Anti-Pattern:** Deploying 5 different XGBoost models in 5 different FastAPI containers. Each container requests 2GB RAM. Total: 10GB RAM reserved, but average usage is 500MB.
+
+**The Fix:** Deploy Triton Inference Server. Load all 5 models into a single container.
+- Resources requested: 3GB RAM.
+- Savings: 70% reduction in base compute costs.
+
+---
+
+## Part 4: Storage & Data Transfer Costs (The Hidden Killers)
+
+### 1. S3 Lifecycle Policies
+
+MLflow artifacts, TensorBoard logs, and raw training data accumulate forever.
+
+```json
+// s3-lifecycle.json
+{
+  "Rules": [
+    {
+      "ID": "Archive Old Training Data",
+      "Filter": { "Prefix": "training-datasets/" },
+      "Status": "Enabled",
+      "Transitions": [
+        { "Days": 30, "StorageClass": "STANDARD_IA" },
+        { "Days": 90, "StorageClass": "GLACIER" }
+      ]
+    },
+    {
+      "ID": "Delete Old Checkpoints",
+      "Filter": { "Prefix": "model-checkpoints/" },
+      "Status": "Enabled",
+      "Expiration": { "Days": 14 }
+    }
+  ]
+}
+```
+
+### 2. The Multi-AZ Data Transfer Trap
+
+AWS charges $0.01/GB for cross-AZ data transfer. 
+If your Redis cluster is in `us-east-1a` and your inference pod is in `us-east-1b`, you pay $0.01 for every GB of features fetched. Over billions of requests, this costs thousands of dollars.
+
+**The Fix:** Topology-Aware Routing. Configure Kubernetes/Istio to prefer routing traffic to pods in the *same* Availability Zone.
+
+---
+
+## Interview Questions (30 Q&A) — See Original Below
+
+---
 
 ## Q1: How do you control infrastructure costs for ML training on Kubernetes?
 **Context:** AWS bill jumped 40% due to hyperparameter sweeps.
@@ -119,3 +287,6 @@
 ## Q30: The hidden cost of Technical Debt in MLOps.
 **Context:** Why invest in automation?
 **Answer:** Manual deployments take 2 engineers 3 days. Automated CI/CD takes 5 minutes. The cost of an MLOps platform engineer is high, but the ROI is massive when you eliminate the manual toil of 50 data scientists.
+
+---
+*Next → [Behavioral & Leadership](../behavioral/README.md)*

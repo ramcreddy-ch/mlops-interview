@@ -1,4 +1,309 @@
-# CI/CD for ML Systems - Interview Questions
+# CI/CD for ML Systems — Production Deep Dive
+## GitOps, Model Versioning, Continuous Training, Canary Automation
+
+---
+
+## Part 1: Software CI/CD vs ML CI/CD — The Paradigm Shift
+
+In traditional software, CI/CD is a linear path: `Code → Test → Build → Deploy`.
+In ML, the process is multidimensional because **Data + Code = Model**.
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                   THE THREE ML TRIGGERS                           │
+├───────────────────────┬──────────────────────┬───────────────────┤
+│  1. CODE TRIGGER      │  2. DATA TRIGGER     │ 3. MODEL TRIGGER  │
+├───────────────────────┼──────────────────────┼───────────────────┤
+│ Data Scientist merges │ Monitoring detects   │ Model finishes    │
+│ PR with new feature   │ data drift or new    │ training and      │
+│ engineering logic.    │ month of data lands. │ passes eval.      │
+├───────────────────────┼──────────────────────┼───────────────────┤
+│ Triggers: CI tests    │ Triggers: CT         │ Triggers: CD      │
+│ (unit, integration)   │ (Continuous Training)│ (Continuous       │
+│ then builds Docker    │ to retrain model     │ Deployment)       │
+│ image.                │ with existing code.  │ to Kubernetes.    │
+└───────────────────────┴──────────────────────┴───────────────────┘
+```
+
+**Rule of Production MLOps:** You NEVER train a model inside your CI pipeline (Jenkins/GitHub Actions). Training takes hours/days and requires GPUs. CI just tests the code syntax and builds the environment. Training happens in the CT pipeline (Airflow/Kubeflow).
+
+---
+
+## Part 2: The ML Continuous Integration (CI) Pipeline
+
+**Goal:** Prevent bad code from breaking the training pipeline.
+
+```yaml
+# .github/workflows/ml-ci.yml — Production ML CI Pipeline
+name: ML Continuous Integration
+
+on:
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'poetry'
+          
+      - name: Install dependencies
+        run: poetry install
+        
+      - name: Lint and Format (Ruff)
+        run: poetry run ruff check . && poetry run ruff format --check .
+
+      - name: Type Checking (MyPy)
+        run: poetry run mypy src/
+        
+      - name: Unit Tests (Fast, no data needed)
+        run: poetry run pytest tests/unit/
+        
+      # CRITICAL ML STEP: Test the training loop on dummy data
+      # Verifies shapes match, loss computes, no NaN explosions
+      - name: Integration Test - Dummy Training
+        run: |
+          poetry run python src/train.py \
+            --data_path=tests/fixtures/dummy_data.parquet \
+            --epochs=2 \
+            --batch_size=4 \
+            --fast_dev_run=True
+            
+      - name: Security Scan (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'local-build'
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Build and Push Training Docker Image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          tags: mycr.io/fraud-trainer:${{ github.sha }}
+```
+
+---
+
+## Part 3: Continuous Training (CT) — Automated Retraining
+
+**Goal:** Retrain the model when data drifts or new labels arrive, without human intervention.
+
+### Orchestrator: Apache Airflow
+
+```python
+# dags/retrain_fraud_model.py
+from airflow import DAG
+from airflow.providers.cncf.kubernetes.operators.kubernetes_pod import KubernetesPodOperator
+from airflow.sensors.external_task import ExternalTaskSensor
+from datetime import datetime, timedelta
+
+default_args = {
+    'owner': 'ml-platform',
+    'depends_on_past': False,
+    'email_on_failure': True,
+    'email': ['ml-alerts@company.com'],
+    'retries': 2,
+    'retry_delay': timedelta(minutes=5),
+}
+
+with DAG(
+    'fraud_model_continuous_training',
+    default_args=default_args,
+    description='Weekly automated retrain of fraud model',
+    schedule_interval='0 2 * * 0', # Every Sunday at 2 AM
+    start_date=datetime(2024, 1, 1),
+    catchup=False,
+) as dag:
+
+    # Step 1: Validate incoming data quality
+    validate_data = KubernetesPodOperator(
+        task_id='validate_data_expectations',
+        name='gx-validate',
+        namespace='ml-training',
+        image='mycr.io/fraud-trainer:latest',
+        cmds=["great_expectations", "checkpoint", "run", "weekly_fraud_data"],
+        get_logs=True,
+    )
+
+    # Step 2: Run training job on GPU node
+    train_model = KubernetesPodOperator(
+        task_id='train_xgboost_model',
+        name='fraud-train',
+        namespace='ml-training',
+        image='mycr.io/fraud-trainer:latest',
+        cmds=["python", "src/train.py"],
+        env_vars={
+            'MLFLOW_TRACKING_URI': 'http://mlflow.ml-platform:5000',
+            'MLFLOW_EXPERIMENT_NAME': 'fraud_automated_retraining'
+        },
+        node_selector={'nvidia.com/gpu': 'true'},
+        # VPA will manage resources, but we set requests
+        container_resources={
+            'request_cpu': '4',
+            'request_memory': '16Gi',
+            'limit_gpu': '1'
+        },
+        get_logs=True,
+    )
+
+    # Step 3: Evaluate model against golden holdout set
+    evaluate_model = KubernetesPodOperator(
+        task_id='evaluate_and_register',
+        name='fraud-eval',
+        namespace='ml-training',
+        image='mycr.io/fraud-trainer:latest',
+        cmds=["python", "src/evaluate.py"],
+        env_vars={
+            'MINIMUM_AUC': '0.85', # Fail pipeline if worse than this
+            'PROMOTE_TO_STAGING': 'true'
+        },
+        get_logs=True,
+    )
+
+    validate_data >> train_model >> evaluate_model
+```
+
+---
+
+## Part 4: Continuous Deployment (CD) — GitOps for ML
+
+**Goal:** The state of production Kubernetes is identical to what is in Git.
+**Tool:** ArgoCD
+
+```
+Workflow:
+1. Airflow evaluates new model -> Registers to MLflow as "Staging"
+2. Human reviews metrics -> Transitions MLflow state to "Production"
+3. Webhook triggers GitHub Action
+4. GitHub Action updates the `model_version` tag in the GitOps repo
+5. ArgoCD detects Git change -> Syncs new model to K8s cluster
+```
+
+### The GitOps Repository (Separate from code repo!)
+
+```yaml
+# gitops-repo/fraud-api/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fraud-api
+  namespace: ml-serving
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: fraud-api
+  template:
+    metadata:
+      labels:
+        app: fraud-api
+    spec:
+      containers:
+      - name: api
+        # Image tag is the CODE version
+        image: mycr.io/fraud-api:v2.4.1
+        env:
+        # This is what changes when a new model is promoted!
+        - name: MODEL_URI
+          value: "s3://mlflow-artifacts/1/abcdef12345/artifacts/model"
+        - name: MLFLOW_RUN_ID
+          value: "abcdef12345"
+```
+
+### The Auto-Promotion Script (Triggered by MLflow webhook):
+
+```bash
+# update_gitops_repo.sh
+NEW_RUN_ID=$1
+MODEL_URI="s3://mlflow-artifacts/1/${NEW_RUN_ID}/artifacts/model"
+
+git clone https://github.com/company/gitops-repo.git
+cd gitops-repo
+
+# Use yq to update the YAML file safely
+yq e -i "(.spec.template.spec.containers[] | select(.name == \"api\").env[] | select(.name == \"MODEL_URI\").value) = \"${MODEL_URI}\"" fraud-api/deployment.yaml
+yq e -i "(.spec.template.spec.containers[] | select(.name == \"api\").env[] | select(.name == \"MLFLOW_RUN_ID\").value) = \"${NEW_RUN_ID}\"" fraud-api/deployment.yaml
+
+git add fraud-api/deployment.yaml
+git commit -m "Auto-deploy: Promote fraud model ${NEW_RUN_ID} to production"
+git push origin main
+# ArgoCD takes over from here!
+```
+
+**Why GitOps is mandatory for ML:**
+If the new model causes a massive spike in false positives, rollback is instant. Just `git revert <commit-hash>` in the GitOps repo. ArgoCD immediately pulls the old model back into production. No pipeline to re-run.
+
+---
+
+## Part 5: Safe Deployments — Canary & Shadow
+
+Never deploy an ML model to 100% of traffic instantly.
+
+### 1. Shadow Deployment (Zero Risk)
+- New model receives 100% of traffic.
+- Makes predictions, logs them to database.
+- Responses are discarded. User only sees V1's response.
+- **Why:** To verify the new model doesn't crash on weird edge-case inputs, and to check latency/memory profiling under real production load.
+
+### 2. Canary Deployment (Low Risk)
+- New model receives 5% of traffic.
+- Real users see the new model's response.
+- **Why:** To verify integration works and catch obvious regressions.
+
+### Automated Canary with Flagger & Istio
+
+```yaml
+apiVersion: flagger.app/v1beta1
+kind: Canary
+metadata:
+  name: fraud-api
+  namespace: ml-serving
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: fraud-api
+  service:
+    port: 8080
+  analysis:
+    interval: 5m
+    threshold: 3
+    maxWeight: 100
+    stepWeight: 10
+    metrics:
+    # Standard software metrics
+    - name: request-success-rate
+      thresholdRange:
+        min: 99
+      interval: 1m
+    - name: request-duration
+      thresholdRange:
+        max: 200
+      interval: 30s
+    # ML-specific metric!
+    - name: prediction-drift-psi
+      thresholdRange:
+        max: 0.1
+      interval: 5m
+```
+
+---
+
+## Interview Questions (30 Q&A) — See Original Below
+
+---
 
 ## Q1: Explain the difference between Software CI/CD and ML CI/CD.
 **Context:** Team was training models inside Jenkins PR builders.
@@ -119,3 +424,6 @@
 ## Q30: Security scanning in the ML CI pipeline.
 **Context:** Preventing CVEs from reaching production.
 **Answer:** In Jenkins, run Trivy or Clair against the built Docker image. If CRITICAL or HIGH vulnerabilities are found in the Python packages (e.g., a vulnerable version of `requests`), the build fails and blocks deployment.
+
+---
+*Next → [Cost Optimization](../cost-optimization/README.md)*
